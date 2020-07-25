@@ -1,4 +1,8 @@
 import { JupyterFrontEnd, JupyterFrontEndPlugin } from '@jupyterlab/application'; 
+import { URLExt } from '@jupyterlab/coreutils';
+import { ServerConnection } from '@jupyterlab/services';
+
+const TIMEOUT_PERIOD = 3600 * 1000;  // 60 min
 
 const idleCheckPlugin: JupyterFrontEndPlugin<void> = {
   id: '@adyne/general:idle-check',
@@ -9,10 +13,37 @@ const idleCheckPlugin: JupyterFrontEndPlugin<void> = {
 function activateIdleCheck(
   app: JupyterFrontEnd
 ): void {
-        console.log(`JupyterLab extension autologout is activated`);
-        var timeout = 300 * 1000;  // 5 min
+        console.log(`JupyterLab extension @adyne.autologout is activated`);
+        var timeout = TIMEOUT_PERIOD;
         var timeoutId = 0;
         var lastTrigger = 0;
+        
+        const SETTINGS = ServerConnection.makeSettings();
+        
+        async function getKernelData() {
+            var active = false;
+            const url = URLExt.join(SETTINGS.baseUrl, 'api/kernels');
+            const response = await ServerConnection.makeRequest(url, {}, SETTINGS);
+            if (response.status !== 200) {
+                console.log(`Error reading server status: ` + response.status);
+                throw new Error('Error reading kernels status');
+            }
+        
+            const data = await response.json();
+            if (!Array.isArray(data)) {
+                throw new Error('Invalid Kernel List');
+            }
+            try {
+                data.forEach(x => {
+                    if (x.execution_state !== 'idle') {
+                        active = true;
+                    }
+                });
+            } catch (err) {
+                console.log(`Error parsing kernels data: ` + err);
+            }
+            return active;
+        }
 
         function startTimer() {
             timeoutId = window.setTimeout(doInactive, timeout);
@@ -28,10 +59,15 @@ function activateIdleCheck(
             }
         }
 
-        function doInactive() {
-            console.log(`auto logout triggered`);
-            window.location.href = "/hub/logout/idle";
-        }
+        async function doInactive() {
+            var serverActive = await getKernelData();
+            if (!serverActive) {
+                window.location.href = "/hub/logout/idle";
+            }
+            else {
+                resetTimer();
+            }
+       }
 
         function setupTimers() {
             document.addEventListener("mousemove", resetTimer);
@@ -44,6 +80,7 @@ function activateIdleCheck(
 
         setupTimers();
     }
+
 const plugins: JupyterFrontEndPlugin<any>[] = [idleCheckPlugin];
 export default plugins;
 

@@ -137,6 +137,7 @@ from jupyterhub.handlers.base import BaseHandler
 from jupyterhub.handlers.login import LoginHandler
 from jupyterhub.handlers.login import LogoutHandler
 from urllib.parse import urlparse
+from datetime import datetime, timezone
 
 class IdleLogoutHandler(LogoutHandler):
 
@@ -238,11 +239,26 @@ class AutoUserUrlHandler(UserUrlHandler):
         else:
             await super(AutoUserUrlHandler, self).get(user_name, user_path)
 
+import pwd
 import pamela
 from jupyterhub.auth import PAMAuthenticator
 from tornado import gen
 
 class KerberosPAMAuthenticator(PAMAuthenticator):
+    k5start_service_template = '''[Unit]
+    Description=Initializes Keytab for @user
+    After=centrifydc.service
+    Requires=centrifydc.service
+
+    [Service]
+    Type=oneshot
+    RemainAfterExit=yes
+    ExecStart=/usr/bin/k5start -U -f /etc/krb5/@user.keytab -K 2 -k /tmp/krb5cc_@uid -L -m 600 -o k5-@user-service -g k5-@user-service -b
+    User=@user
+    TimeoutStopSec=15
+
+    [Install]
+    WantedBy=multi-user.target'''
     def __init__(self, **kwargs):
         # app_log.info('authenticator constructor')        
         super(KerberosPAMAuthenticator, self).__init__(**kwargs)
@@ -250,6 +266,48 @@ class KerberosPAMAuthenticator(PAMAuthenticator):
     # controls whether to authenticate prod id...
     authenticate_prod_id = True
     
+    def create_keytab(self, username, pw):
+        try:
+            principal = '%s@ALPHANETCAPITAL.COM' % username
+            encryption = 'arcfour-hmac'
+            keytab = '/etc/krb5/%s.keytab' % username
+            # check if keytab exists
+            if os.path.exists(keytab):
+                # check if keytab is valid...
+                cmd = ['kinit', '-k', '-t', keytab, principal]
+                result = subprocess.run(cmd, stderr=subprocess.PIPE).stderr.decode('utf8')
+                if not result:
+                   return
+            # create new keytab file
+            self.log.info('creating keytab for %s' % username )
+            cmd = ['printf "%%b" "addent -password -p %s -k 1 -e %s\n%s\nwkt %s" | ktutil' % (principal, encryption, pw, keytab)]
+            result = subprocess.run(cmd, shell=True, executable='/bin/bash', stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.log.info('creating keytab for %s:\n%s' % (username, result.stdout.decode('utf8')))
+            if result.stderr:
+                self.log.warning('Error creating k5start servive for %s:\n%s' % (username, result.stderr.decode('utf8')))
+
+        except Exception as ex:
+            self.log.error('Error creating keytab file for: %s' % username)
+            
+    def create_k5start_service(self, username):
+        try:
+            # check if service exists
+            service_file = '/etc/systemd/system/k5start-%s.service' % username
+            if not os.path.exists(service_file):
+                uid = pwd.getpwnam(username).pw_uid
+                service = self.k5start_service_template.replace('@user', username).replace('@uid', str(uid))
+                with open(service_file, 'w') as f:
+                    f.write(service)
+                self.log.info('k5start service file create for %s' % username)
+                cmd = ['systemctl', 'daemon-reload']
+                stderr = subprocess.run(cmd, stderr=subprocess.PIPE).stderr.decode('utf8')
+                self.log.info('k5start service started for %s' % username)
+                if stderr:
+                    self.log.warning('Error stsrting k5start dservice for %s:\n%s' % (username, stderr))
+                
+        except Exception as ex:
+            self.log.error('Error creating k5start service for: %s' % username)
+        
     @gen.coroutine
     def authenticate(self, handler, data):
         """
@@ -276,6 +334,8 @@ class KerberosPAMAuthenticator(PAMAuthenticator):
             else:
                 self.log.warning("PAM Authentication failed: %s", e)
         else:
+            self.create_keytab(username, data['password'])
+            self.create_k5start_service(username)
             return {'name': username, 'auth_state': {'KERBEROS_PASSWORD': data['password']}}
 
     @gen.coroutine
@@ -549,7 +609,7 @@ c.JupyterHub.init_spawners_timeout = 30
 #c.JupyterHub.jinja_environment_options = {}
 
 ## Interval (in seconds) at which to update last-activity timestamps.
-#c.JupyterHub.last_activity_interval = 300
+c.JupyterHub.last_activity_interval = 300
 
 ## Dict of 'group': ['usernames'] to load at startup.
 #  
@@ -591,6 +651,8 @@ c.JupyterHub.init_spawners_timeout = 30
 
 ## DEPRECATED since version 0.8: Use ConfigurableHTTPProxy.auth_token
 #c.JupyterHub.proxy_auth_token = ''
+
+#c.ConfigurableHTTPProxy.api_url = ''
 
 ## Interval (in seconds) at which to check if the proxy is running.
 c.JupyterHub.proxy_check_interval = 300
@@ -659,11 +721,12 @@ c.JupyterHub.service_check_interval = 120
 #              'environment':
 #          }
 #      ]
+import sys
 c.JupyterHub.services = [
                  {
                     'name': 'cull_idle',
                     'admin': True,
-                    'command': ['python3', '/opt/tljh/hub/bin/cull_idle_servers.py', '--timeout=900'],
+                    'command': [sys.executable, '/opt/tljh/hub/bin/cull_idle_servers.py', '--timeout=900'],
                  },
                  {
                     'name': 'cull_idle',
@@ -673,7 +736,7 @@ c.JupyterHub.services = [
               ]
 
 ## Shuts down all user servers on logout
-#c.JupyterHub.shutdown_on_logout = True
+c.JupyterHub.shutdown_on_logout = True
 
 ## The class to use for spawning single-user servers.
 #  
@@ -731,7 +794,7 @@ c.JupyterHub.ssl_key = '/var/local/sslcert/adyne_wildcard.key'
 #c.JupyterHub.template_vars = {}
 
 ## Extra settings overrides to pass to the tornado application.
-#c.JupyterHub.tornado_settings = {}
+c.JupyterHub.tornado_settings = {'cookie_options': {'expires_days': None}}
 
 ## Trust user-provided tokens (via JupyterHub.service_tokens) to have good
 #  entropy.
@@ -943,6 +1006,15 @@ def set_lab_data(spawner):
 def set_lab_source(spawner):
     return '/home/%s/.jupyterlab/%s' % (spawner.user.name, 'n_drive')
 
+def set_lab_source_s(spawner):
+    return '/home/%s/.jupyterlab/%s' % (spawner.user.name, 's_drive')
+
+def set_lab_source_y(spawner):
+    return '/home/%s/.jupyterlab/%s' % (spawner.user.name, 'y_drive')
+
+def set_lab_source_q(spawner):
+    return '/home/%s/.jupyterlab/%s' % (spawner.user.name, 'q_drive')
+
 ## Create temp folder that notebooks can use for intermediate data
 #
 #  For typical users it will be of the form
@@ -989,6 +1061,15 @@ c.Spawner.environment = {
          # N drive
          'SOURCE': set_lab_source,
          '_N_DRIVE': set_lab_source,
+         # S drive
+         'S_SOURCE': set_lab_source_s,
+         '_S_DRIVE': set_lab_source_s,
+         # Y drive
+         'Y_SOURCE': set_lab_source_y,
+         '_Y_DRIVE': set_lab_source_y,
+         # Q drive
+         'Q_SOURCE': set_lab_source_q,
+         '_Q_DRIVE': set_lab_source_q,    
          # TEMP
          'TEMP': set_lab_temp,
          # for alib
@@ -1125,8 +1206,20 @@ c.Spawner.notebook_dir = '/home/{username}/.jupyterlab'
 #  
 #      c.Spawner.pre_spawn_hook = my_hook
 
+## imports for user hook functions
+
+import os
+import shutil
+import pwd
+import subprocess
 from tornado.log import app_log
-def clone_git_repo(user_dir, user_name):
+
+## clone_git_repo function
+#
+# for new users clone the git repo to their newly created share
+# to be run as the user
+
+def clone_git_repo(user_share, user_name):
     if os.environ.get('JUPYTERLAB_GIT_REPO'):
         app_log.info('env is: %s' % os.environ['JUPYTERLAB_GIT_REPO'])
         # git repo defined in env variable
@@ -1137,18 +1230,15 @@ def clone_git_repo(user_dir, user_name):
         # clone the Dev branch for developers to get latest commits
         cmd = ['/usr/bin/git', 'clone', '--branch', 'Dev', git_repo]
         # add timeout to prevent git process from hanging jupyterhub
-        with subprocess.Popen(cmd, cwd=user_dir, env=git_env) as proc:
+        with subprocess.Popen(cmd, cwd=user_share, env=git_env) as proc:
             try:
-                # wait 45 sec then kill the subproccess
+                # wait 45 sec then kill the subprocess
                 proc.wait(45)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 app_log.warn('Time out cloning git repo for: %s' % user_name)
-                pass
 
-import os
-import shutil
-def config_git_repo(home_dir, user_dir, uid, gid):
+def config_git_repo(home_dir, base_dir, uid, gid):
     # set up filters
     attr_dir = os.path.join(home_dir, '.config', 'git')
     attr = os.path.join(attr_dir, 'attributes')
@@ -1160,7 +1250,7 @@ def config_git_repo(home_dir, user_dir, uid, gid):
         os.chown(os.path.join(home_dir, '.config', 'git'), uid, gid)
        
     # set up pre-commit
-    git_base = os.path.join(user_dir, 'notebooks')
+    git_base = os.path.join(base_dir, 'notebooks')
     config = os.path.join(git_base, '.git', 'config')
     if not os.path.exists(config):
         shutil.copyfile('/opt/tljh/hub/share/git-config/config', config)
@@ -1192,15 +1282,162 @@ def config_git_repo(home_dir, user_dir, uid, gid):
         shutil.copyfile('/opt/tljh/hub/share/git-config/pre-commit', hook)
         os.chown(hook, uid, gid)
 
-# for first time users and will check for existing users.  Users should
+def create_user_share(home_dir, base_dir, username, uid, gid):
+    #check if user folder exists on share...
+    # this code still requires the following mount to 
+    # create the user directory for new users...
+    #
+    #  /mnt/jupyterpersonal/
+    #
+    if not os.path.exists(base_dir):
+        try:
+            app_log.info('creating user base dir: %s' % base_dir)
+            os.makedirs(base_dir, 0o755)
+            os.chown(base_dir, uid, gid)
+        except Exception as ex:
+            app_log.error('Exception creating base directories for user: %s' % username)
+            app_log.exception(ex)
+
+    user_share = os.path.join('/mnt', 'jupyterpersonal', username)
+    if not os.path.exists(user_share):
+        try:
+            app_log.info('creating user shared mount: %s' % base_dir)
+            os.mkdir(user_share,  0o755)
+            os.chown(user_share, uid, gid)
+            try:
+                clone_git_repo(user_share, username)
+            except Exception as ex:
+                app_log.error('Exception cloning jupyterhub git repository: %s' % username)
+                app_log.exception(ex)
+
+        except Exception as ex:
+            app_log.error('Exception creating user_share: %s' % user_share)
+            app_log.exception(ex)
+
+    appmode_dir = os.path.join(user_share, '.appmode.checkpoints')
+    if not os.path.exists(appmode_dir):
+        try:
+            os.mkdir(appmode_dir,  0o755)
+            os.chown(appmode_dir, uid, gid)
+        except Exception as ex:
+            app_log.error('Exception creating appmode_dir: %s' % username)
+            app_log.exception(ex)
+
+    # ---->
+    # for now check git config for each launch 
+    # move to under new user after transition perioda
+    # by indenting this block 4 spaces 
+    try:
+        app_log.info('Setting git repo configuration for %s' % username)
+        config_git_repo(home_dir, user_share, uid, gid)
+    except Exception as ex:
+        app_log.error('Exception configuring git repository: %s' % username)
+        app_log.exception(ex)
+    # end config git block
+    # ---->
+
+def mount_user_drives(spawner, base_dir, username, uid, gid):
+    # mounting map...
+    drive_map = {
+       '//USAPPFS02/JupyterPersonal/@user':    '@user',
+       '//ad-ttw-fs01/psg':                    'n_drive', 
+       '//ad-ttw-fs01/public':                 'p_drive', 
+       #'//USAPPFS02/JupyterShared/Production': 'prod',
+       #'//jpfs02/public':                      'q_drive',
+       #'//alphanetcapital.com/as/apps':        's_drive', 
+       #'//ad-ttw-fs01/adynefs':                'y_drive',
+       '/mnt/jupytershared/Production':        'prod', 
+       '/mnt/publicjp':                        'q_drive', 
+       '/mnt/asdfsapps':                       's_drive', 
+       '/mnt/adynefs':                         'y_drive'
+       } 
+
+    def remove_user_links(base_dir, username):
+        # the old mounts that required sym-links 
+        # are no longer needed and are removed
+        for key, value in drive_map.items():
+            try:
+                if key.startswith('//'):
+                    file = os.path.join(base_dir, value.replace('@user', username)) 
+                    if os.path.islink(file):
+                        app_log.info('removing link for %s: %s' % (username, file))
+                        os.unlink(os.path.join(base_dir, file))
+            except Exception as ex:
+                app_log.error('Exception removing old symlinks for user: %s' % username)
+                app_log.exception(ex)
+
+    def update_fstab(username):
+        fstab = '/etc/fstab'
+        fstype = 'cifs'
+        fsoptions  = 'sec=krb5,nobrl,noauto,user'
+        fsdump = 0
+        fsorder = 0
+        mount_base = '/home/%s/.jupyterlab' % username
+        with open(fstab, 'r') as f:
+            base_fstab = f.read()
+        if ('## %s' % username) not in base_fstab:
+            try:
+                with open(fstab, 'a') as f:
+                    f.write('\n## %s\n' % username)
+                    for key, val in drive_map.items():
+                        if key.startswith('//'):
+                            fsspec = key.replace('@user', username)
+                            drive = val.replace('@user', username)
+                            mount = os.path.join(mount_base, drive)
+                            entry = '\n%s\t%s\t%s %s %s %s' % (fsspec, mount, fstype, fsoptions, fsdump, fsorder) 
+                            app_log.info('Adding /etc/fstab entry for user: %s: %s' % (username, entry))
+                            f.write(entry)
+            except Exception as ex:
+                app_log.error('Exception updating fstab for user: %s' % username)
+                app_log.exception(ex)
+
+    def create_mount(base_dir, drive, uid, gid):
+        if not os.path.exists(drive):
+            os.mkdir(drive,  0o755)
+            os.chown(drive, uid, gid)
+        if not os.path.ismount(drive):    
+            app_log.info('creating mount for %s' % drive)
+            cmd = ['/bin/mount', drive]
+            preexec_fn = spawner.make_preexec_fn(spawner.user.name)
+            with subprocess.Popen(cmd, cwd=base_dir, preexec_fn=preexec_fn) as proc:
+                try:
+                    # wait 30 sec then kill the subprocess
+                    proc.wait(30)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    app_log.warn('Time out mounting drive: %s' % drive)
+                except Exception as ex:
+                    app_log.warn('Exception mounting drives: %s' % drive)
+
+    def create_mount_link(src, dest):
+        if not os.path.exists(dest):
+            try:
+                app_log.info('creating sym-link for %s: %s' % (src, dest))
+                os.symlink(src, dest)
+            except Exception as ex:
+                app_log.warn('Exception creatimg sym-link: %s/%s' % (src, dest))
+                 
+    # update the fstab table if not set
+    update_fstab(username);
+    
+    # remove old legacy links..
+    remove_user_links(base_dir, username)
+    
+    # mount the drives
+    for key, value in drive_map.items():
+        drive = os.path.join(base_dir, value.replace('@user', username))
+        if key.startswith('//'):
+            create_mount(base_dir, drive, uid, gid)
+        else:
+            create_mount_link(key, drive)
+
+# for first time users it will check for existing users.  Users should
 # not be able to alter this structure from JupyterLab file browser, but 
 # may be able to do so through the terminals whether intentionally or 
 # otherwise.  In either eveent it will restore the base structure at 
 # login, unless they modified the permissions, which will report an 
 # error, but should otherwise allow the login to proceed.
 
-import pwd
-import subprocess
 def setup_user_hook(spawner):
     try:
         username = spawner.user.name
@@ -1208,80 +1445,26 @@ def setup_user_hook(spawner):
         app_log.info('path is: %s' % os.environ['PATH'])
         home_dir = os.path.join('/home', username)
         base_dir = os.path.join('/home', username, '.jupyterlab')
-        user_dir = os.path.join('/mnt', 'jupyterpersonal', username)
-        prod_dir = os.path.join('/mnt', 'jupytershared', 'Production')
-        data_dir = os.path.join('/mnt', 'jupyterdata')
-        qpfs_dir = os.path.join('/mnt', 'qpfs')
-        cpnt_dir = os.path.join(user_dir, '.appmode.checkpoints')
+   
+        # get user info...   
         user = pwd.getpwnam(username)
         uid = user.pw_uid
         gid = user.pw_gid
         home = user.pw_dir
-        #check if user folder exists on share...
-        if not os.path.exists(base_dir):
-            try:
-                app_log.info('creating user base dir: %s' % base_dir)
-                os.makedirs(base_dir)
-                os.chown(base_dir, uid, gid)
-            except Exception as ex:
-                app_log.error('Exception creating base directories for user: %s' % spawner.user.name)
-                app_log.exception(ex)
-                pass
-        # check if shared drive personal dir exists
-        if not os.path.exists(user_dir):
-            app_log.info('creating user shared mount: %s' % user_dir)
-            os.mkdir(user_dir,  0o755)
-            os.chown(user_dir, uid, gid)
-            try:
-                clone_git_repo(user_dir, username)
-            except Exception as ex:
-                app_log.error('Exception cloning jupyterhub git repository: %s' % spawner.user.name)
-                app_log.exception(ex)
-                pass
-        # ---->
-        # for now check git config for each launch 
-        # move to under new user after transition perioda
-        # by indenting this block 4 spaces 
-        try:
-            app_log.info('Git repo configuration for %s' % username)
-            config_git_repo(home_dir, user_dir, uid, gid)
-        except Exception as ex:
-            app_log.error('Exception configuring git repository: %s' % spawner.user.name)
-            app_log.exception(ex)
-            pass
-        # end config git block
-        # ---->
+        
+        # create user shares if not exists 
+        # and mount drives for users...
+        create_user_share(home_dir, base_dir, username, uid, gid)
+        mount_user_drives(spawner, base_dir, username, uid, gid)
 
-        if not os.path.exists(cpnt_dir):
-            os.mkdir(cpnt_dir,  0o755)
-            os.chown(cpnt_dir, uid, gid)
-   
-        # check if sym-links exists...
-        user_link = os.path.join(base_dir, username)
-        prod_link = os.path.join(base_dir, 'prod')
-        p_drv_link = os.path.join(base_dir, 'p_drive')
-        n_drv_link = os.path.join(base_dir, 'n_drive')
-        if not os.path.exists(user_link):
-            app_log.info('creating dev (user-id) sym-link: %s' % user_link) 
-            os.symlink(user_dir, user_link)
-        if not os.path.exists(prod_link):
-            app_log.info('creating prod sym-link for user: %s' % username)
-            os.symlink(prod_dir, prod_link)
-        if not os.path.exists(p_drv_link):
-            app_log.info('creating p-drive sym-link for user: %s' % username)
-            os.symlink(data_dir, p_drv_link)
-        if not os.path.exists(n_drv_link):
-            app_log.info('creating n-drive sym-link for user: %s' % username)
-            os.symlink(qpfs_dir, n_drv_link)
     except Exception as ex:
         app_log.error('Exception settup up directories for user: %s' % spawner.user.name)
         app_log.exception(ex)
-        pass
     finally:
         # change home dir ownership here in case it was left as root
         # when created.  async timing seems to be off for some new users
         # app_log.info('environment variable data: %s  alib:  %s' %(os.environ['JUPYTERLAB_DATA'], os.environ['ALPHA_FS']))
-	
+    
         if os.path.exists(home):
             app_log.info('checking user home dirctory permissions')
             app_log.info(os.system('ls -lad /home/%s' % spawner.user.name))
